@@ -1,73 +1,48 @@
 use anyhow::{anyhow, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Location {
-    city: String,
-    country: String,
-}
+mod api;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Target {
-    name: String,
-    url: String,
-    location: Location,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Client {
-    ip: String,
-    asn: String,
-    isp: String,
-    location: Location,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ApiResponse {
-    client: Client,
-    targets: Vec<Target>,
+enum DownloadType<'a> {
+    Url(&'a mut api::Target),
+    Total,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = reqwest::Client::new();
-    let url = "https://api.fast.com/netflix/speedtest/v2";
-    let params = [
-        ("https", "false"),
-        ("token", "YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm"),
-    ];
-
+    let client = api::Api::new();
     print!("Finding hosts... ");
     std::io::stdout().flush().unwrap();
 
-    let response = client.get(url).query(&params).send().await?;
-    let response = response.text().await?;
-    let response = serde_json::from_str::<ApiResponse>(&response)?;
+    let mut response = client.get_hosts().await?;
     println!("{} hosts found.", response.targets.len());
 
     let mut urls = response
         .targets
-        .iter()
-        .map(|x| x.url.to_string())
+        .iter_mut()
+        .map(|x| Arc::new(Mutex::new(DownloadType::Url(x))))
         .collect::<Vec<_>>();
     let urls_count = urls.len();
-    urls.push("__TOTAL__".to_string());
+    urls.push(Arc::new(Mutex::new(DownloadType::Total)));
 
     let start_time = std::time::Instant::now();
 
     let mp = MultiProgress::new();
+
     let current_size = AtomicU64::new(0);
     let total_size = AtomicU64::new(0);
 
     let downloads = urls
         .iter()
-        .cloned()
         .map(|url| async {
-            if url == "__TOTAL__" {
-                let pb = mp.add(ProgressBar::new(total_size.load(Ordering::Relaxed)));
+            let url = &mut *url.lock().await;
+            match url {
+                DownloadType::Total => {
+                    let pb = mp.add(ProgressBar::new(total_size.load(Ordering::Relaxed)));
                 pb.set_style(
                     ProgressStyle::with_template(
                         "{spinner:.green} [{bar:.green}] [{msg}] [{elapsed_precise}] {bytes}/{total_bytes}",
@@ -78,29 +53,28 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 }
                 while current_size.load(Ordering::Relaxed) < total_size.load(Ordering::Relaxed) {
-                    pb.set_length(total_size.load(Ordering::Relaxed));
-                    pb.set_position(current_size.load(Ordering::Relaxed));
+                    let total_size = total_size.load(Ordering::Relaxed);
+                    let current_size = current_size.load(Ordering::Relaxed);
+                    pb.set_length(total_size);
+                    pb.set_position(current_size);
                     let elapsed = std::time::Instant::now()
                         .duration_since(start_time)
                         .as_secs_f32();
 
-                    let downloaded_mb = current_size.load(Ordering::Relaxed) as f32 / 1_000_000.0;
+                    let downloaded_mb = current_size as f32 / 1_000_000.0;
                     let speed = downloaded_mb / elapsed;
                     pb.set_message(format!("{speed:.2} Mb/s"));
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 }
                 pb.finish_and_clear();
-                return Ok(());
-            }
-
-            let pb = mp.add(ProgressBar::new(0));
-            let mut download = reqwest::get(url).await?;
-            let content_length = download
-                .content_length()
-                .ok_or(anyhow!("Unable to get content length"))?
+                },
+                DownloadType::Url(url) => {
+                    let pb = mp.add(ProgressBar::new(0));
+                    let content_length = url.content_length().await?;
+            let content_length = content_length
                 / urls_count as u64;
-            
             total_size.fetch_add(content_length, Ordering::Relaxed);
+            
             pb.set_length(content_length);
             pb.set_style(
                 ProgressStyle::with_template(
@@ -109,7 +83,7 @@ async fn main() -> Result<()> {
                 .unwrap(),
             );
 
-            while let Ok(Some(chunk)) = download.chunk().await {
+            while let Ok(Some(chunk)) = url.response().ok_or(anyhow!("Unable to get response"))?.chunk().await {
                 //pb.set_position(progress as u64);
                 pb.inc(chunk.len() as u64);
                 current_size.fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -119,6 +93,9 @@ async fn main() -> Result<()> {
             }
 
             pb.finish_and_clear();
+                },
+            }
+
             Ok::<(), anyhow::Error>(())
         })
         .collect::<Vec<_>>();
