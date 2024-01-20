@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Location {
@@ -47,48 +48,84 @@ async fn main() -> Result<()> {
     let response = serde_json::from_str::<ApiResponse>(&response)?;
     println!("{} hosts found.", response.targets.len());
 
-    let target = response
+    let mut urls = response
         .targets
-        .first()
-        .ok_or(anyhow!("Unable to find first target"))?;
-    let url = target.url.clone();
-
-    let download = reqwest::get(url);
+        .iter()
+        .map(|x| x.url.to_string())
+        .collect::<Vec<_>>();
+    let urls_count = urls.len();
+    urls.push("__TOTAL__".to_string());
 
     let start_time = std::time::Instant::now();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
-    tokio::spawn(async move {
-        let Ok(mut download) = download.await else {
-            eprintln!("Failed to get chunk");
-            return Err(anyhow!("failed to get chunk"));
-        };
+    let mp = MultiProgress::new();
+    let current_size = AtomicU64::new(0);
+    let total_size = AtomicU64::new(0);
 
-        let total_size = download.content_length().unwrap_or(25_000_000);
-        tx.send(total_size as usize).await?;
+    let downloads = urls
+        .iter()
+        .cloned()
+        .map(|url| async {
+            if url == "__TOTAL__" {
+                let pb = mp.add(ProgressBar::new(total_size.load(Ordering::Relaxed)));
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner:.green} [{bar:.green}] [{msg}] [{elapsed_precise}] {bytes}/{total_bytes}",
+                    )
+                    .unwrap(),
+                );
+                while current_size.load(Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                while current_size.load(Ordering::Relaxed) < total_size.load(Ordering::Relaxed) {
+                    pb.set_length(total_size.load(Ordering::Relaxed));
+                    pb.set_position(current_size.load(Ordering::Relaxed));
+                    let elapsed = std::time::Instant::now()
+                        .duration_since(start_time)
+                        .as_secs_f32();
 
-        while let Some(chunk) = download.chunk().await? {
-            tx.send(chunk.len()).await?;
-        }
-        Ok(())
-    });
+                    let downloaded_mb = current_size.load(Ordering::Relaxed) as f32 / 1_000_000.0;
+                    let speed = downloaded_mb / elapsed;
+                    pb.set_message(format!("{speed:.2} Mb/s"));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                pb.finish_and_clear();
+                return Ok(());
+            }
 
-    let pb = match rx.recv().await {
-        Some(size) => ProgressBar::new(size as u64),
-        None => return Err(anyhow!("Failed to get size")),
-    };
+            let pb = mp.add(ProgressBar::new(0));
+            let mut download = reqwest::get(url).await?;
+            let content_length = download
+                .content_length()
+                .ok_or(anyhow!("Unable to get content length"))?
+                / urls_count as u64;
+            
+            total_size.fetch_add(content_length, Ordering::Relaxed);
+            pb.set_length(content_length);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} [{bar}]",
+                )
+                .unwrap(),
+            );
 
-    pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-        .unwrap());
+            while let Ok(Some(chunk)) = download.chunk().await {
+                //pb.set_position(progress as u64);
+                pb.inc(chunk.len() as u64);
+                current_size.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                if pb.position() >= content_length {
+                    break;
+                }
+            }
 
-    let mut current_size = 0;
-    while let Some(progress) = rx.recv().await {
-        //pb.set_position(progress as u64);
-        pb.inc(progress as u64);
-        current_size += progress;
-    }
+            pb.finish_and_clear();
+            Ok::<(), anyhow::Error>(())
+        })
+        .collect::<Vec<_>>();
 
-    pb.finish_and_clear();
+    futures::future::try_join_all(downloads).await?;
+
+    let current_size = current_size.load(Ordering::Relaxed);
 
     let current_size_mib = current_size as f32 / 1_000_000.0;
     let time_taken_secs = std::time::Instant::now()
@@ -97,7 +134,7 @@ async fn main() -> Result<()> {
 
     let speed_mib_s = current_size_mib / time_taken_secs;
     println!(
-        "  Download: {:.2} MB/s | {:.2} Mbps | {} byte/s in {:.2}s.",
+        "  Download: {:.2} MB/s\n            {:.2} Mbps\n            {} byte/s in {:.2}s.",
         speed_mib_s,
         speed_mib_s * 8.0,
         current_size,
