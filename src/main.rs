@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
             let content_length = content_length
                 / urls_count as u64;
             total_size.fetch_add(content_length, Ordering::Relaxed);
-            
+
             pb.set_length(content_length);
             pb.set_style(
                 ProgressStyle::with_template(
