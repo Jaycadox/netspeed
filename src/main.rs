@@ -1,7 +1,7 @@
-use std::io::Write;
-use std::sync::Arc;
 use anyhow::Result;
 use indicatif::MultiProgress;
+use std::io::Write;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 mod api;

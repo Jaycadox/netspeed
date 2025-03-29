@@ -1,9 +1,10 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::api;
 use anyhow::anyhow;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
-use crate::api;
+use url::Url;
 
 pub enum DownloadType<'a> {
     Url(&'a mut api::Target),
@@ -35,11 +36,15 @@ impl SpeedTest {
                 async move {
                     let mut x = x.lock().await;
                     if let DownloadType::Url(target) = &mut *x {
-                        total_size.fetch_add(target.content_length().await? / target_count as u64, Ordering::Relaxed);
+                        total_size.fetch_add(
+                            target.content_length().await? / target_count as u64,
+                            Ordering::Relaxed,
+                        );
                     }
                     Ok::<(), anyhow::Error>(())
                 }
-            }).collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
         futures::future::try_join_all(resolve_sizes).await?;
 
         Ok(Self {
@@ -49,11 +54,15 @@ impl SpeedTest {
         })
     }
 
-    pub async fn start(&mut self, mp: &MultiProgress, targets: &[Arc<Mutex<DownloadType<'_>>>]) -> anyhow::Result<SpeedTestOutput> {
+    pub async fn start(
+        &mut self,
+        mp: &MultiProgress,
+        targets: &[Arc<Mutex<DownloadType<'_>>>],
+    ) -> anyhow::Result<SpeedTestOutput> {
         let target_count = targets.len();
         self.start_time = std::time::Instant::now();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
 
         let downloads = targets
             .iter()
@@ -61,7 +70,9 @@ impl SpeedTest {
                 let url = &mut *url.lock().await;
                 match url {
                     DownloadType::Total => self.total_progress_bar(&mp, tx.clone()).await?,
-                    DownloadType::Url(url) => self.download_progress_bar(url, target_count, &mp).await?,
+                    DownloadType::Url(url) => {
+                        self.download_progress_bar(url, target_count, &mp).await?
+                    }
                 }
 
                 Ok::<(), anyhow::Error>(())
@@ -80,27 +91,45 @@ impl SpeedTest {
 
         Ok(SpeedTestOutput {
             total_size: self.current_size.load(Ordering::Relaxed),
-            total_time_secs: std::time::Instant::now().duration_since(self.start_time).as_secs_f32(),
+            total_time_secs: std::time::Instant::now()
+                .duration_since(self.start_time)
+                .as_secs_f32(),
             avg_speed,
         })
     }
 
-    async fn download_progress_bar(&self, target: &mut api::Target, target_count: usize, mp: &MultiProgress) -> anyhow::Result<()> {
+    async fn download_progress_bar(
+        &self,
+        target: &mut api::Target,
+        target_count: usize,
+        mp: &MultiProgress,
+    ) -> anyhow::Result<()> {
         let pb = mp.add(ProgressBar::new(0));
         let content_length = target.content_length().await?;
-        let content_length = content_length
-            / target_count as u64;
+        let content_length = content_length / target_count as u64;
 
         pb.set_length(content_length);
+
+        let host_name = Url::parse(&target.url)
+            .expect("Invalid URL")
+            .host_str()
+            .expect("Failed to get URL hostname")
+            .to_string();
+
         pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{bar}]",
-            ).unwrap(),
+            ProgressStyle::with_template(&format!("{{spinner:.green}} [{{bar}}] {}", host_name))
+                .unwrap(),
         );
 
-        while let Ok(Some(chunk)) = target.response().ok_or(anyhow!("Unable to get response"))?.chunk().await {
+        while let Ok(Some(chunk)) = target
+            .response()
+            .ok_or(anyhow!("Unable to get response"))?
+            .chunk()
+            .await
+        {
             pb.inc(chunk.len() as u64);
-            self.current_size.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            self.current_size
+                .fetch_add(chunk.len() as u64, Ordering::Relaxed);
             if pb.position() >= content_length {
                 break;
             }
@@ -111,13 +140,17 @@ impl SpeedTest {
         Ok(())
     }
 
-    async fn total_progress_bar(&self, mp: &MultiProgress, speeds: tokio::sync::mpsc::Sender<f32>) -> anyhow::Result<()> {
+    async fn total_progress_bar(
+        &self,
+        mp: &MultiProgress,
+        speeds: tokio::sync::mpsc::Sender<f32>,
+    ) -> anyhow::Result<()> {
         let pb = mp.add(ProgressBar::new(self.total_size));
         pb.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} [{bar:.green}] [{msg}] [{elapsed_precise}] {bytes}/{total_bytes}",
             )
-                .unwrap(),
+            .unwrap(),
         );
 
         while self.current_size.load(Ordering::Relaxed) < self.total_size {
